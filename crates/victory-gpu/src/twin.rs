@@ -653,10 +653,7 @@ mod tests {
             p
         };
         let depth = committed(DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_STATE_COPY_DEST.0).expect("depth texture");
-        let Some(twin) = make(40, &depth) else {
-            eprintln!("no D32 twin on this host; skipped");
-            return;
-        };
+        let twin = make(40, &depth).expect("writable D32 twin");
         assert!(twin.routes.iter().all(|r| r.depth.is_none()), "direct routes");
         assert!(twin.scratch.is_none(), "no scratch for a D32 twin");
 
@@ -696,7 +693,8 @@ mod tests {
         unsafe { upload.Map(0, None, Some(&mut data)) }.expect("map");
         let f = footprint[0];
         let (pitch, at) = (f.Footprint.RowPitch as usize, f.Offset as usize);
-        let values: [f32; 16] = std::array::from_fn(|i| (i + 1) as f32);
+        // Use distinct, exactly representable depths in [0, 1].
+        let values: [f32; 16] = std::array::from_fn(|i| (i + 1) as f32 / 16.0);
         for y in 0..4 {
             for x in 0..4 {
                 // SAFETY: inside the mapped footprint, one row of four texels.
