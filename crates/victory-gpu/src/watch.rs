@@ -43,6 +43,15 @@ use std::sync::{Arc, Mutex};
 /// they saved.
 pub(crate) const PAGE: usize = 64 << 10;
 
+#[cfg(test)]
+thread_local! {
+    /// `VirtualProtect` calls the test thread's [`open_range`] made, and
+    /// whether [`open_pages`] should take the old one-call-per-page path
+    /// (the benchmark times both).
+    pub(crate) static TEST_OPEN_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub(crate) static TEST_OPEN_ONE_BY_ONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// The pages a tracker has not taken since they changed, what it saves of
 /// pages it armed, its bit in [`DIRTY`] (none: always taken as dirty), and
 /// whether it is a host buffer copy's (the only trackers [`retake`] marks).
@@ -430,27 +439,88 @@ impl Drop for Tracked {
                 }
             }
         }
+        let mut to_open = Vec::new();
         for page in free {
             let watched_elsewhere = g.alias_of.get(&page).is_some_and(|o| o.iter().any(|p| g.holders.contains_key(p)));
             if !watched_elsewhere {
-                open(&mut g, page);
+                to_open.push(page);
             }
         }
+        open_pages(&mut g, &to_open);
     }
 }
 
-/// Gives write access back to page `page` if we guarded it.
-fn open(g: &mut Guards, page: usize) -> bool {
+/// Gives write access back to the guarded pages of `[first, last)` with one
+/// `VirtualProtect` call, if any are guarded; returns how many.
+fn open_range(g: &mut Guards, first: usize, last: usize) -> usize {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    if !g.protected.remove(&page) {
-        return false;
+    let mut pages = 0;
+    for page in first..last {
+        if g.protected.remove(&page) {
+            pages += 1;
+        }
     }
+    if pages == 0 {
+        return 0;
+    }
+    // Only a whole run of guarded pages is opened: a gap in it would make
+    // memory write-watchable or not ours writable.
+    debug_assert_eq!(pages, last - first, "a partial run is not opened in one call");
     let mut old = 0;
     // SAFETY: a block we made read-only (failing harmlessly if it is gone).
-    unsafe { VirtualProtect((page * PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old) };
+    let batch = unsafe {
+        VirtualProtect(
+            (first * PAGE) as *const _,
+            (last - first) * PAGE,
+            PAGE_READWRITE,
+            &mut old,
+        )
+    } != 0;
+    if !batch {
+        // Windows refuses one call across separate allocations or over an
+        // uncommitted page, even when every page is ours: restore the run a
+        // page at a time, as the old path did.
+        for page in first..last {
+            let mut old = 0;
+            // SAFETY: as above, one page.
+            unsafe {
+                VirtualProtect((page * PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old)
+            };
+        }
+    }
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::OpenPages, 1);
-    true
+    crate::copystat::add(crate::copystat::C::OpenPages, pages as u64);
+    #[cfg(test)]
+    TEST_OPEN_CALLS.with(|c| c.set(c.get() + 1));
+    pages
+}
+
+/// [`open`] for sorted pages, one `VirtualProtect` per run of consecutive
+/// guarded pages instead of one per page. Writes of a whole range (a
+/// title's `memset` or file read) and a tracker's drop open long runs.
+fn open_pages(g: &mut Guards, pages: &[usize]) {
+    #[cfg(test)]
+    if TEST_OPEN_ONE_BY_ONE.with(|c| c.get()) {
+        for &page in pages {
+            open_range(g, page, page + 1);
+        }
+        return;
+    }
+    let mut i = 0;
+    while i < pages.len() {
+        if !g.protected.contains(&pages[i]) {
+            i += 1;
+            continue;
+        }
+        let first = pages[i];
+        let mut last = first + 1;
+        i += 1;
+        while i < pages.len() && pages[i] == last && g.protected.contains(&pages[i]) {
+            last += 1;
+            i += 1;
+        }
+        open_range(g, first, last);
+    }
 }
 
 impl Tracked {
@@ -736,9 +806,7 @@ fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
 /// Gives write access back to the pages of `[first, last)` we guarded.
 fn open_guarded(g: &mut Guards, first: usize, last: usize) {
     let guarded: Vec<usize> = g.protected.range(first..last).copied().collect();
-    for page in guarded {
-        open(g, page);
-    }
+    open_pages(g, &guarded);
 }
 
 /// Marks `[first, last)` changed in the trackers holding its pages. With
@@ -980,8 +1048,109 @@ pub(crate) mod tests {
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
-    /// Everything is changed at first; after taking, only what is written
-    /// (by faults, or reported) is, and every tracker of a page sees it.
+    /// Windows refuses one `VirtualProtect` across two separate
+    /// allocations, even when the pages are adjacent and both guarded: the
+    /// per-page fallback must still make them writable.
+    #[test]
+    fn open_runs_falls_back_across_separate_allocations() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, VirtualAlloc,
+            VirtualFree,
+        };
+        // Reserve room, give it back, then allocate each page on its own.
+        // SAFETY: fresh allocations, freed below.
+        let hint = unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_NOACCESS) } as usize;
+        if hint == 0 {
+            return;
+        }
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(hint as *mut _, 0, MEM_RELEASE) };
+        // SAFETY: fresh allocations at the freed addresses.
+        let (a, b) = unsafe {
+            (
+                VirtualAlloc(hint as *const _, PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READONLY) as usize,
+                VirtualAlloc((hint + PAGE) as *const _, PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READONLY) as usize,
+            )
+        };
+        if a == 0 || b != a + PAGE {
+            // SAFETY: whichever allocations were made are ours.
+            unsafe {
+                if a != 0 {
+                    VirtualFree(a as *mut _, 0, MEM_RELEASE);
+                }
+                if b != 0 {
+                    VirtualFree(b as *mut _, 0, MEM_RELEASE);
+                }
+            }
+            eprintln!("two adjacent separate allocations unavailable; skipped");
+            return;
+        }
+        let pages = [a / PAGE, b / PAGE];
+        TEST_OPEN_ONE_BY_ONE.with(|c| c.set(false));
+        {
+            let mut g = guards();
+            for &page in &pages {
+                g.protected.insert(page);
+            }
+            open_pages(&mut g, &pages);
+            assert!(pages.iter().all(|p| !g.protected.contains(p)));
+        }
+        assert!(writable(a) && writable(b), "both pages read-write after the fallback");
+        // SAFETY: our allocations.
+        unsafe {
+            VirtualFree(a as *mut _, 0, MEM_RELEASE);
+            VirtualFree(b as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    /// A write over a run of guarded pages opens them with one
+    /// `VirtualProtect` call, not one per page.
+    #[test]
+    fn a_bulk_write_opens_guarded_pages_in_one_call() {
+        let p = pool(8);
+        let t = track(p, 8 * PAGE, true).expect("pool memory is tracked");
+        assert_eq!(t.take(p, p + 8 * PAGE), [(p, p + 8 * PAGE)]);
+        TEST_OPEN_ONE_BY_ONE.with(|c| c.set(false));
+        TEST_OPEN_CALLS.with(|c| c.set(0));
+        drop(writing(p, 8 * PAGE));
+        assert_eq!(TEST_OPEN_CALLS.with(|c| c.get()), 1, "one call for the run");
+        for page in 0..8 {
+            assert!(writable(p + page * PAGE), "page {page} writable again");
+        }
+        drop(t);
+        free(p);
+    }
+
+    /// `cargo test --release -p victory-gpu benchmark_guard_open_runs -- --ignored --test-threads=1 --nocapture`.
+    #[test]
+    #[ignore = "benchmark: one VirtualProtect per page against one per run"]
+    fn benchmark_guard_open_runs() {
+        const PAGES: usize = 512;
+        const ROUNDS: usize = 20;
+        let p = pool(PAGES);
+        let t = track(p, PAGES * PAGE, true).expect("pool memory is tracked");
+        for (label, one_by_one) in [("one call per page", true), ("one call per run", false)] {
+            TEST_OPEN_ONE_BY_ONE.with(|c| c.set(one_by_one));
+            let mut calls = 0;
+            let mut elapsed = std::time::Duration::ZERO;
+            for _ in 0..ROUNDS {
+                // Guard every page again (outside the timed write).
+                let _ = t.take(p, p + PAGES * PAGE);
+                TEST_OPEN_CALLS.with(|c| c.set(0));
+                let started = std::time::Instant::now();
+                drop(writing(p, PAGES * PAGE));
+                elapsed += started.elapsed();
+                calls += TEST_OPEN_CALLS.with(|c| c.get());
+            }
+            println!(
+                "{label}: {calls} VirtualProtect calls over {ROUNDS} rounds, {elapsed:?}"
+            );
+        }
+        TEST_OPEN_ONE_BY_ONE.with(|c| c.set(false));
+        drop(t);
+        free(p);
+    }
+
     #[test]
     fn writes_mark_every_tracker_of_their_page() {
         let p = pool(4);
