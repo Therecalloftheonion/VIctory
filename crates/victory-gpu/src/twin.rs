@@ -13,6 +13,11 @@
 //! value written as 16-bit depth compares equal to the same depth
 //! rasterised.
 //!
+//! Subresources of the same format family (a D32 depth's R32 plane, a
+//! stencil's R8 one) copy straight between the depth texture and the twin:
+//! no scratch buffer, so a D32 twin takes one texture of GPU memory rather
+//! than two. The scratch holds only the converted 16-bit planes.
+//!
 //! shortcut: uses the lists do not name (shaders indexing the heap
 //! themselves) move nothing; a whole twin is copied for any use of either
 //! plane, also when the next pass overwrites all of it; console 24-bit
@@ -50,15 +55,16 @@ pub(crate) static COPIES: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) struct Twin {
     /// The colour texture of each plane the depth texture has (depth, then
-    /// stencil), shader-writable.
+    /// stencil if it has one), shader-writable.
     pub(crate) planes: Vec<Arc<HostTexture>>,
     /// Which side is newer as of the lists submitted so far.
     pub(crate) newer: AtomicU8,
     /// Per plane and subresource: how its bytes go through `scratch`.
     routes: Vec<Route>,
-    /// A shader-writable buffer the copies go through, in the common state
-    /// between them.
-    scratch: ID3D12Resource,
+    /// A shader-writable buffer the converted copies go through, in the
+    /// common state between them; `None` when every route copies directly
+    /// between the two textures (no format conversion).
+    scratch: Option<ID3D12Resource>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the rest is atomics and data.
@@ -164,14 +170,27 @@ fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
         unsafe { host.device.GetCopyableFootprints(&td, 0, subs, 0, Some(tf.as_mut_ptr()), Some(trows.as_mut_ptr()), None, None) };
         for s in 0..subs {
             let d = (p as u32 * subs + s) as usize;
-            let same = df[d].Footprint.Format == td.Format;
-            // The same bytes: both sides copy through the depth texture's
-            // footprint; else each its own, converted between.
+            let same = crate::resource::family(df[d].Footprint.Format.0 as u32) == crate::resource::family(td.Format.0 as u32);
+            // The same bytes: the two textures copy the subresource straight
+            // between them. Else each side goes through the scratch, the
+            // depth plane converted.
             let route = if same {
-                Route { plane: p, twin_sub: s, depth_sub: d as u32, twin: place(df[d], drows[d]), depth: None }
+                Route {
+                    plane: p,
+                    twin_sub: s,
+                    depth_sub: d as u32,
+                    twin: D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(),
+                    depth: None,
+                }
             } else {
                 let twin = place(tf[s as usize], trows[s as usize]);
-                Route { plane: p, twin_sub: s, depth_sub: d as u32, twin, depth: Some(place(df[d], drows[d])) }
+                Route {
+                    plane: p,
+                    twin_sub: s,
+                    depth_sub: d as u32,
+                    twin,
+                    depth: Some(place(df[d], drows[d])),
+                }
             };
             if route.depth.is_some() && (td.Format != DXGI_FORMAT_R16_TYPELESS || df[d].Footprint.Format != DXGI_FORMAT_R32_TYPELESS) {
                 once(console, td.Format.0 as u32, df[d].Footprint.Format.0 as u32, "a depth twin plane with no conversion to the host's: not made");
@@ -180,7 +199,10 @@ fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
             routes.push(route);
         }
     }
-    let scratch = shared_scratch(at)?;
+    // Only converted routes need a scratch buffer; D32 twins copy directly
+    // and take no extra GPU memory. The converted ones share buffers by
+    // size with every other twin.
+    let scratch = if at > 0 { Some(shared_scratch(at)?) } else { None };
     tracing::debug!(console, width = dd.Width, height = dd.Height, planes = planes.len(), "a writable twin for a depth texture");
     Some(Twin { planes, newer: AtomicU8::new(DEPTH), routes, scratch })
 }
@@ -416,14 +438,7 @@ impl Twin {
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: sub },
         };
-        let placed = |f: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: as above.
-            pResource: unsafe { std::mem::transmute_copy(&self.scratch) },
-            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: f },
-        };
         let converts = self.routes.iter().any(|r| r.depth.is_some());
-        let state = |from, to| transition(&self.scratch, D3D12_RESOURCE_STATES(from), D3D12_RESOURCE_STATES(to));
         let mut converted = false;
         // SAFETY: an open list; live resources in the states named (the
         // scratch buffer starts common: its first copy promotes it).
@@ -431,40 +446,65 @@ impl Twin {
             if !barriers.is_empty() {
                 l.ResourceBarrier(&barriers);
             }
-            for r in &self.routes {
+            // Subresources with the same bytes on both sides (a D32 twin's):
+            // copied straight between the two textures. A depth-stencil
+            // copy is the whole subresource, as D3D12 requires.
+            for r in self.routes.iter().filter(|r| r.depth.is_none()) {
                 let plane = &self.planes[r.plane].texture;
                 if to_depth {
-                    l.CopyTextureRegion(&placed(r.twin), 0, 0, 0, &at(plane, r.twin_sub), None);
+                    l.CopyTextureRegion(&at(&depth.texture, r.depth_sub), 0, 0, 0, &at(plane, r.twin_sub), None);
                 } else {
-                    l.CopyTextureRegion(&placed(r.depth.unwrap_or(r.twin)), 0, 0, 0, &at(&depth.texture, r.depth_sub), None);
+                    l.CopyTextureRegion(&at(plane, r.twin_sub), 0, 0, 0, &at(&depth.texture, r.depth_sub), None);
                 }
             }
-            if converts && let Some(c) = converter() {
-                l.ResourceBarrier(&[state(COPY_DEST as i32, UNORDERED_ACCESS as i32)]);
-                l.SetComputeRootSignature(&c.root);
-                l.SetPipelineState(&c.pso);
-                l.SetComputeRootUnorderedAccessView(1, self.scratch.GetGPUVirtualAddress());
-                for r in &self.routes {
-                    let Some(d) = r.depth else { continue };
-                    let (t, d) = (r.twin.Footprint, d);
-                    let constants = [t.Width, t.Height, t.RowPitch, r.twin.Offset as u32, d.Footprint.RowPitch, d.Offset as u32, u32::from(to_depth), 0];
-                    l.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
-                    l.Dispatch(t.Width.div_ceil(2).div_ceil(64), t.Height, 1);
+            if converts {
+                let Some(scratch) = self.scratch.as_ref() else {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| tracing::warn!("a depth twin copy without its buffer: the sides are not moved"));
+                    return false;
+                };
+                let placed = |f: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
+                    // SAFETY: as above.
+                    pResource: std::mem::transmute_copy(scratch),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: f },
+                };
+                let state = |from, to| transition(scratch, D3D12_RESOURCE_STATES(from), D3D12_RESOURCE_STATES(to));
+                for r in self.routes.iter().filter(|r| r.depth.is_some()) {
+                    let plane = &self.planes[r.plane].texture;
+                    if to_depth {
+                        l.CopyTextureRegion(&placed(r.twin), 0, 0, 0, &at(plane, r.twin_sub), None);
+                    } else {
+                        l.CopyTextureRegion(&placed(r.depth.unwrap_or(r.twin)), 0, 0, 0, &at(&depth.texture, r.depth_sub), None);
+                    }
                 }
-                l.ResourceBarrier(&[uav_barrier(), state(UNORDERED_ACCESS as i32, COPY_SOURCE as i32)]);
-                converted = true;
-            } else {
-                l.ResourceBarrier(&[state(COPY_DEST as i32, COPY_SOURCE as i32)]);
-            }
-            for r in &self.routes {
-                let plane = &self.planes[r.plane].texture;
-                if to_depth {
-                    l.CopyTextureRegion(&at(&depth.texture, r.depth_sub), 0, 0, 0, &placed(r.depth.unwrap_or(r.twin)), None);
+                if let Some(c) = converter() {
+                    l.ResourceBarrier(&[state(COPY_DEST as i32, UNORDERED_ACCESS as i32)]);
+                    l.SetComputeRootSignature(&c.root);
+                    l.SetPipelineState(&c.pso);
+                    l.SetComputeRootUnorderedAccessView(1, scratch.GetGPUVirtualAddress());
+                    for r in self.routes.iter().filter(|r| r.depth.is_some()) {
+                        let Some(d) = r.depth else { continue };
+                        let (t, d) = (r.twin.Footprint, d);
+                        let constants = [t.Width, t.Height, t.RowPitch, r.twin.Offset as u32, d.Footprint.RowPitch, d.Offset as u32, u32::from(to_depth), 0];
+                        l.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
+                        l.Dispatch(t.Width.div_ceil(2).div_ceil(64), t.Height, 1);
+                    }
+                    l.ResourceBarrier(&[uav_barrier(), state(UNORDERED_ACCESS as i32, COPY_SOURCE as i32)]);
+                    converted = true;
                 } else {
-                    l.CopyTextureRegion(&at(plane, r.twin_sub), 0, 0, 0, &placed(r.twin), None);
+                    l.ResourceBarrier(&[state(COPY_DEST as i32, COPY_SOURCE as i32)]);
                 }
+                for r in self.routes.iter().filter(|r| r.depth.is_some()) {
+                    let plane = &self.planes[r.plane].texture;
+                    if to_depth {
+                        l.CopyTextureRegion(&at(&depth.texture, r.depth_sub), 0, 0, 0, &placed(r.depth.unwrap_or(r.twin)), None);
+                    } else {
+                        l.CopyTextureRegion(&at(plane, r.twin_sub), 0, 0, 0, &placed(r.twin), None);
+                    }
+                }
+                l.ResourceBarrier(&[state(COPY_SOURCE as i32, 0)]);
             }
-            l.ResourceBarrier(&[state(COPY_SOURCE as i32, 0)]);
         }
         COPIES.fetch_add(1, Relaxed);
         converted
@@ -592,6 +632,187 @@ mod tests {
         assert_eq!(again(DEPTH, &mut last, DEPTH, false), None);
         assert_eq!(again(DEPTH, &mut last, TWIN, true), Some(false));
         assert_eq!(last, Some(TWIN));
+    }
+
+    /// A D32 depth texture and its twin hold the same bytes, so the twin
+    /// copies each subresource straight between the two textures and keeps
+    /// no scratch buffer (a full extra texture in GPU memory). Runs the
+    /// copy on the host GPU and reads the twin back: the formats must be
+    /// compatible for the copy, which WARP would not prove.
+    #[test]
+    fn a_d32_twin_copies_directly_and_takes_no_scratch() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let dev = &host.device;
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Alignment: 0,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_D32_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+        };
+        let committed = |format: DXGI_FORMAT, state| -> Option<ID3D12Resource> {
+            let mut p: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation into our out pointer.
+            unsafe {
+                dev.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC { Format: format, ..desc },
+                    D3D12_RESOURCE_STATES(state),
+                    None,
+                    &mut p,
+                )
+            }
+            .ok()?;
+            p
+        };
+        let depth = committed(DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_STATE_COPY_DEST.0).expect("depth texture");
+        let Some(twin) = make(40, &depth) else {
+            eprintln!("no D32 twin on this host; skipped");
+            return;
+        };
+        assert!(twin.routes.iter().all(|r| r.depth.is_none()), "direct routes");
+        assert!(twin.scratch.is_none(), "no scratch for a D32 twin");
+
+        // The known value of each texel, uploaded into the depth texture.
+        let mut footprint = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 1];
+        let mut rows = [0u32; 1];
+        let mut total = 0u64;
+        // SAFETY: arrays sized for one subresource; out pointers ours.
+        unsafe {
+            dev.GetCopyableFootprints(&desc, 0, 1, 0, Some(footprint.as_mut_ptr()), Some(rows.as_mut_ptr()), None, Some(&mut total));
+        }
+        let mut upload: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation and mapping of an upload buffer.
+        unsafe {
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: total,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                None,
+                &mut upload,
+            )
+        }
+        .expect("upload buffer");
+        let upload = upload.expect("upload buffer");
+        let mut data = std::ptr::null_mut();
+        // SAFETY: a live upload buffer.
+        unsafe { upload.Map(0, None, Some(&mut data)) }.expect("map");
+        let f = footprint[0];
+        let (pitch, at) = (f.Footprint.RowPitch as usize, f.Offset as usize);
+        let values: [f32; 16] = std::array::from_fn(|i| (i + 1) as f32);
+        for y in 0..4 {
+            for x in 0..4 {
+                // SAFETY: inside the mapped footprint, one row of four texels.
+                unsafe { (data as *mut u8).add(at + y * pitch + x * 4).cast::<f32>().write_unaligned(values[y * 4 + x]) };
+            }
+        }
+        // SAFETY: the mapping is ours.
+        unsafe { upload.Unmap(0, None) };
+
+        // Upload the texels, then copy the depth texture into the twin.
+        let sub = |r: &ID3D12Resource, i: u32| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the copy does not release.
+            pResource: unsafe { std::mem::transmute_copy(r) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i },
+        };
+        let placed = |r: &ID3D12Resource, f: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above.
+            pResource: unsafe { std::mem::transmute_copy(r) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: f },
+        };
+        let list = host.new_list().expect("a list");
+        // SAFETY: an open list and live resources in the states named.
+        unsafe {
+            list.list.CopyTextureRegion(&sub(&depth, 0), 0, 0, 0, &placed(&upload, f), None);
+        }
+        list.close();
+        host.execute(&[&list]);
+
+        let depth = Arc::new(HostTexture::new(depth, 0, Vec::new()));
+        let list = host.new_list().expect("a list");
+        let mut barriers = vec![transition(&depth.texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)];
+        barriers.extend(twin.planes.iter().map(|p| transition(&p.texture, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)));
+        // SAFETY: an open list and live textures; the copies below move
+        // only subresources between their named states.
+        unsafe { list.list.ResourceBarrier(&barriers) };
+        assert!(!twin.copy(&list.list, &depth, false, &mut |_, _| None), "no conversion");
+
+        // Read the twin plane back.
+        let plane = &twin.planes[0];
+        // SAFETY: a live resource.
+        let pd = unsafe { plane.texture.GetDesc() };
+        let mut tf = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 1];
+        let mut trows = [0u32; 1];
+        let mut ttotal = 0u64;
+        // SAFETY: arrays for one subresource.
+        unsafe { dev.GetCopyableFootprints(&pd, 0, 1, 0, Some(tf.as_mut_ptr()), Some(trows.as_mut_ptr()), None, Some(&mut ttotal)) };
+        let mut back: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a readback buffer.
+        unsafe {
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: ttotal,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut back,
+            )
+        }
+        .expect("readback buffer");
+        let back = back.expect("readback buffer");
+        // SAFETY: an open list; the twin plane goes to the readback buffer.
+        unsafe {
+            list.list.ResourceBarrier(&[transition(&plane.texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            list.list.CopyTextureRegion(&placed(&back, tf[0]), 0, 0, 0, &sub(&plane.texture, 0), None);
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: a plain query of a live device after the list ran.
+        assert!(unsafe { dev.GetDeviceRemovedReason() }.is_ok(), "the direct copy removed the device");
+
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: a live readback resource.
+        unsafe { back.Map(0, None, Some(&mut mapped)) }.expect("map readback");
+        let tf = tf[0];
+        let (pitch, at) = (tf.Footprint.RowPitch as usize, tf.Offset as usize);
+        for y in 0..4 {
+            for x in 0..4 {
+                // SAFETY: inside the readback footprint.
+                let got = unsafe { (mapped as *const u8).add(at + y * pitch + x * 4).cast::<f32>().read_unaligned() };
+                assert_eq!(got, values[y * 4 + x], "texel {x},{y}");
+            }
+        }
+        // SAFETY: the mapping is ours.
+        unsafe { back.Unmap(0, None) };
     }
 
     /// A list that writes a depth texture through its twin and then reads
