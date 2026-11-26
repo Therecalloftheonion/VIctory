@@ -266,7 +266,7 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
         // fmin with 1.0 and fmax with -1.0 in memory, against a negative
         // and a positive operand.
         for operand in [-2.0f32, 0.5] {
-            let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
             for u in &shader.user_data {
                 let constants = [TITLE as u32, (TITLE >> 32) as u32, value, operand.to_bits()];
                 ud[u.index as usize] = match u.root {
@@ -458,7 +458,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
             continue;
         };
         let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
-        let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         // The table at heap index 0, the copy's view at 1, the root address
         // 16 bytes into it.
         (ud[4], ud[6], ud[7]) = (0, 1, 16);
@@ -594,7 +594,7 @@ fn writes_through_views_mark_their_pages() {
             continue;
         };
         let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
-        let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         for u in &shader.user_data {
             ud[u.index as usize] = if u.root == RootType::Constants { value } else { 0 };
         }
@@ -728,7 +728,7 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
         };
         let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
         // The heap's base is 0 in the user data (`emit`, "Binding").
-        let ud = vec![0u32; shader.user_data_dwords() as usize];
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         let out = host
             .dispatch(
                 &root,
